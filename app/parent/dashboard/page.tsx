@@ -2,7 +2,8 @@
 
 import { useAuth } from "@/components/auth-provider"
 import { useEffect, useState } from "react"
-import { supabase } from "@/lib/supabase"
+import { dataService } from "@/lib/services"
+import type { Kid, PendingActivity, DashboardStats } from "@/lib/services/types"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -11,30 +12,17 @@ import { Users, Star, Trophy, Plus, Clock, CheckCircle, XCircle } from "lucide-r
 import Link from "next/link"
 import { ParentLayout } from "@/components/parent-layout"
 
-interface Kid {
-  id: string
-  display_name: string
-  total_points: number
-}
-
-interface PendingActivity {
-  id: string
-  activity_name: string
-  kid_name: string
-  points: number
-  submitted_at: string
-}
-
 export default function ParentDashboard() {
   const { user } = useAuth()
   const [kids, setKids] = useState<Kid[]>([])
   const [pendingActivities, setPendingActivities] = useState<PendingActivity[]>([])
-  const [stats, setStats] = useState({
+  const [stats, setStats] = useState<DashboardStats>({
     totalKids: 0,
     totalActivities: 0,
     totalRewards: 0,
     pendingApprovals: 0,
   })
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     if (user?.family_id) {
@@ -46,80 +34,55 @@ export default function ParentDashboard() {
     if (!user?.family_id) return
 
     try {
-      // Fetch kids with their total points
-      const { data: kidsData } = await supabase
-        .from("user_profiles")
-        .select(`
-          id,
-          display_name,
-          point_entries(points)
-        `)
-        .eq("family_id", user.family_id)
-        .eq("role", "kid")
-
-      const kidsWithPoints =
-        kidsData?.map((kid) => ({
-          id: kid.id,
-          display_name: kid.display_name,
-          total_points: kid.point_entries?.reduce((sum: number, entry: any) => sum + entry.points, 0) || 0,
-        })) || []
-
-      setKids(kidsWithPoints)
-
-      // Fetch pending activities
-      const { data: pendingData } = await supabase
-        .from("point_entries")
-        .select(`
-          id,
-          points,
-          submitted_at,
-          activities(name),
-          user_profiles(display_name)
-        `)
-        .eq("family_id", user.family_id)
-        .eq("status", "pending")
-        .order("submitted_at", { ascending: false })
-
-      const pendingFormatted =
-        pendingData?.map((entry) => ({
-          id: entry.id,
-          activity_name: entry.activities?.name || "Unknown Activity",
-          kid_name: entry.user_profiles?.display_name || "Unknown Kid",
-          points: entry.points,
-          submitted_at: entry.submitted_at,
-        })) || []
-
-      setPendingActivities(pendingFormatted)
-
-      // Fetch stats
-      const [activitiesCount, rewardsCount] = await Promise.all([
-        supabase.from("activities").select("id", { count: "exact" }).eq("family_id", user.family_id),
-        supabase.from("rewards").select("id", { count: "exact" }).eq("family_id", user.family_id),
+      // Fetch all dashboard data in parallel
+      const [kidsResult, pendingResult, statsResult] = await Promise.all([
+        dataService.fetchKidsWithPoints(user.family_id),
+        dataService.fetchPendingActivities(user.family_id),
+        dataService.fetchDashboardStats(user.family_id)
       ])
 
-      setStats({
-        totalKids: kidsWithPoints.length,
-        totalActivities: activitiesCount.count || 0,
-        totalRewards: rewardsCount.count || 0,
-        pendingApprovals: pendingFormatted.length,
-      })
+      // Handle kids data
+      if (kidsResult.error) {
+        console.error("Error fetching kids:", kidsResult.error)
+      } else {
+        setKids(kidsResult.data || [])
+      }
+
+      // Handle pending activities
+      if (pendingResult.error) {
+        console.error("Error fetching pending activities:", pendingResult.error)
+      } else {
+        setPendingActivities(pendingResult.data || [])
+      }
+
+      // Handle stats
+      if (statsResult.error) {
+        console.error("Error fetching stats:", statsResult.error)
+      } else {
+        setStats(statsResult.data || {
+          totalKids: 0,
+          totalActivities: 0,
+          totalRewards: 0,
+          pendingApprovals: 0,
+        })
+      }
     } catch (error) {
       console.error("Error fetching dashboard data:", error)
+    } finally {
+      setLoading(false)
     }
   }
 
   const handleApproval = async (entryId: string, approved: boolean) => {
-    try {
-      const { error } = await supabase
-        .from("point_entries")
-        .update({
-          status: approved ? "approved" : "rejected",
-          approved_at: new Date().toISOString(),
-          approved_by: user?.id,
-        })
-        .eq("id", entryId)
+    if (!user?.id) return
 
-      if (error) throw error
+    try {
+      const { error } = await dataService.approvePointEntry(entryId, approved, user.id)
+      
+      if (error) {
+        console.error("Error updating approval:", error)
+        return
+      }
 
       // Refresh data
       fetchDashboardData()
